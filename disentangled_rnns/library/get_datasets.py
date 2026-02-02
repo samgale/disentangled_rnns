@@ -14,9 +14,9 @@
 
 """Load datasets."""
 
+import copy
 import json
 import os
-from typing import Literal, cast
 import urllib.request
 
 from disentangled_rnns.library import pclicks
@@ -146,7 +146,7 @@ def get_rat_bandit_dataset(rat_i: int = 0) -> rnn_utils.DatasetRNN:
   ys = np.concatenate((free_choices, -1*np.ones((1, n_sess, 1))), axis=0)
 
   # Pack into a DatasetRNN object
-  dataset_rat = rnn_utils.DatasetRNN(ys=ys, xs=xs, y_type='categorical')
+  dataset_rat = rnn_utils.DatasetRNNCategorical(ys=ys, xs=xs)
 
   return dataset_rat
 
@@ -243,7 +243,7 @@ def get_pclicks_dataset(rat_i: int = 0) -> rnn_utils.DatasetRNN:
   ys = -1*np.ones((101, n_trials, 1))
   ys[-1,:, 0] = choices
 
-  dataset_rat = rnn_utils.DatasetRNN(xs, ys, y_type='categorical')
+  dataset_rat = rnn_utils.DatasetRNNCategorical(xs, ys)
 
   return dataset_rat
 
@@ -328,7 +328,7 @@ def get_bounded_accumulator_dataset(
   )
   ys = -1 * np.ones((stim_duration_max + 1, n_trials, 1))
   ys[-1, :, 0] = decisions
-  dataset = rnn_utils.DatasetRNN(xs, ys, y_type='categorical')
+  dataset = rnn_utils.DatasetRNNCategorical(xs, ys)
   return dataset
 
 
@@ -340,7 +340,8 @@ def dataset_list_to_multisubject(
 
   Multisubject dataset has a new first column containing an integer subject ID.
   DisRNN in multisubject mode will convert this first to a one-hot then to a
-  subject embedding.
+  subject embedding. The returned DatasetRNN will inherit properties like
+  `batch_mode` and `batch_size` from the first dataset in `dataset_list`.
 
   Args:
     dataset_list: List of single-subject datasets
@@ -353,19 +354,6 @@ def dataset_list_to_multisubject(
   """
   data = dataset_list[0].get_all()
   xs_dataset, ys_dataset = data['xs'], data['ys']
-  x_names = dataset_list[0].x_names
-  y_names = dataset_list[0].y_names
-  y_type_str = dataset_list[0].y_type
-  n_classes = dataset_list[0].n_classes
-
-  # Runtime check for y_type_str before casting
-  allowed_y_types = ('categorical', 'scalar', 'mixed')
-  if y_type_str not in allowed_y_types:
-    raise ValueError(
-        f'Invalid y_type "{y_type_str}" found in dataset_list. '
-        f'Expected one of {allowed_y_types}.')
-  # Cast for pytype
-  y_type = cast(Literal['categorical', 'scalar', 'mixed'], y_type_str)
 
   # If we're adding a subject ID, we'll add a feature to the xs
   if add_subj_id:
@@ -383,22 +371,12 @@ def dataset_list_to_multisubject(
   # multisubject dataset
   for dataset_i in range(len(dataset_list)):
     # Check datasets are compatible
-    assert x_names == dataset_list[dataset_i].x_names, (
-        f'x_names do not match across datasets. Expected {x_names}, got'
-        f' {dataset_list[dataset_i].x_names}'
-    )
-    assert y_names == dataset_list[dataset_i].y_names, (
-        f'y_names do not match across datasets. Expected {y_names}, got'
-        f' {dataset_list[dataset_i].y_names}'
-    )
-    assert y_type == dataset_list[dataset_i].y_type, (
-        f'y_type does not match across datasets. Expected {y_type}, got'
-        f' {dataset_list[dataset_i].y_type}'
-    )
-    assert n_classes == dataset_list[dataset_i].n_classes, (
-        f'n_classes does not match across datasets. Expected {n_classes}, got'
-        f' {dataset_list[dataset_i].n_classes}'
-    )
+    if not rnn_utils.datasets_are_compatible(
+        dataset_list[0], dataset_list[dataset_i]
+    ):
+      raise ValueError(
+          f'Dataset {dataset_i} is not compatible with dataset 0.'
+      )
 
     data = dataset_list[dataset_i].get_all()
     xs_dataset, ys_dataset = data['xs'], data['ys']
@@ -458,16 +436,16 @@ def dataset_list_to_multisubject(
     ys = np.concatenate((ys, ys_dataset), axis=1)
 
   if add_subj_id:
-    x_names = ['Subject ID'] + x_names
+    x_names = ['Subject ID'] + dataset_list[0].x_names
+  else:
+    x_names = dataset_list[0].x_names
 
-  dataset = rnn_utils.DatasetRNN(
-      xs=xs,
-      ys=ys,
-      x_names=x_names,
-      y_names=y_names,
-      y_type=y_type,
-      n_classes=n_classes,
-  )
+  dataset = copy.deepcopy(dataset_list[0])
+  dataset._xs = xs  # pylint: disable=protected-access
+  dataset._ys = ys  # pylint: disable=protected-access
+  dataset._n_episodes = np.shape(xs)[1]  # pylint: disable=protected-access
+  dataset._n_timesteps = np.shape(xs)[0]  # pylint: disable=protected-access
+  dataset.x_names = x_names
 
   return dataset
 

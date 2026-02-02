@@ -51,6 +51,13 @@ class GetDatasetsTest(absltest.TestCase):
         [dataset1, dataset2]
     )
     self.assertIsInstance(multisubject_dataset, rnn_utils.DatasetRNN)
+    data_dict = multisubject_dataset.get_all()
+    xs = data_dict["xs"]
+    ys = data_dict["ys"]
+    self.assertEqual(xs.shape[0], 12)
+    self.assertEqual(ys.shape[0], 12)
+    self.assertEqual(xs.shape[1], 20)
+    self.assertEqual(ys.shape[1], 20)
 
 
 if __name__ == "__main__":

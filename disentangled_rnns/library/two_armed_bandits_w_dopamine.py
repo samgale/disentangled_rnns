@@ -192,12 +192,11 @@ def create_dataset(
         np.concatenate(([experiment.choices], [prev_rpes]), axis=0), 0, 1
     )
 
-  dataset = rnn_utils.DatasetRNN(
+  dataset = rnn_utils.DatasetRNNMixed(
       xs=xs,
       ys=ys,
       x_names=['prev choice', 'prev reward'],
       y_names=['choice', 'dopamine'],
-      y_type='mixed',
       n_classes=2,
       batch_size=batch_size,
   )

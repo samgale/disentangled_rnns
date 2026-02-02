@@ -528,12 +528,11 @@ def create_dataset(
     )
     ys[:, sess_i] = np.expand_dims(experiment.choices, 1)
 
-  dataset = rnn_utils.DatasetRNN(
+  dataset = rnn_utils.DatasetRNNCategorical(
       xs=xs,
       ys=ys,
       x_names=['prev choice', 'prev reward'],
       y_names=['choice'],
-      y_type='categorical',
       n_classes=2,
   )
   return dataset

@@ -30,10 +30,9 @@ def make_gru_network():
 def get_agent_network():
   params, _, _ = rnn_utils.train_network(
       make_gru_network,
-      training_dataset=rnn_utils.DatasetRNN(
+      training_dataset=rnn_utils.DatasetRNNCategorical(
           xs=np.zeros((10, 1, 2)),
           ys=np.zeros((10, 1, 1)),
-          y_type='categorical',
           n_classes=2,
       ),
       validation_dataset=None,

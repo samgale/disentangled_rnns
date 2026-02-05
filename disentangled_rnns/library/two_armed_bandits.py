@@ -403,7 +403,10 @@ class AgentNetwork:
   """
 
   def __init__(
-      self, make_network: Callable[[], hk.RNNCore], params: rnn_utils.RnnParams
+      self, make_network: Callable[[], hk.RNNCore],
+      params: rnn_utils.RnnParams,
+      network_input: np.ndarray, # xs for one session from DatasetRNN 
+      # trials x 1 x inputs (choice and reward and last two inputs)
   ):
 
     def step_network(
@@ -425,15 +428,16 @@ class AgentNetwork:
     self._model_fun = jax.jit(
         lambda xs, state: model.apply(params, xs, state)
     )
-    self._xs = np.zeros((1, 2))
+    self._xs = network_input.copy()
     self.new_session()
 
   def new_session(self):
     self._rnn_state = self._initial_state
+    self.trial_index = 0
 
   def get_choice_probs(self) -> np.ndarray:
-    output_logits, _ = self._model_fun(self._xs, self._rnn_state)
-    choice_probs = np.asarray(jax.nn.softmax(output_logits[0]))
+    output_logits, _ = self._model_fun(self._xs[self.trial_index], self._rnn_state)
+    choice_probs = np.asarray(jax.nn.softmax(output_logits[0,:2]))
     return choice_probs
 
   def get_choice(self) -> tuple[int, np.ndarray]:
@@ -442,8 +446,9 @@ class AgentNetwork:
     return choice
 
   def update(self, choice: int, reward: int):
-    self._xs = np.array([[choice, reward]])
-    _, self._rnn_state = self._model_fun(self._xs, self._rnn_state)
+    self.trial_index += 1
+    self._xs[self.trial_index,0,-2:] = np.array([[choice, reward]])
+    _, self._rnn_state = self._model_fun(self._xs[self.trial_index], self._rnn_state)
 
 
 Agent = Union[AgentQ, AgentLeakyActorCritic, AgentNetwork]
@@ -480,9 +485,10 @@ def run_experiment(
     # First agent makes a choice
     attempted_choice = agent.get_choice()
     # Then environment computes a reward
-    choice, reward, _ = environment.step(attempted_choice)
+    choice, reward, _ = environment.step(attempted_choice, step)
     # Finally agent learns
-    agent.update(choice, reward)
+    if step < n_steps-1:
+        agent.update(choice, reward)
     # Log choice and reward
     choices[step] = choice
     rewards[step] = reward

@@ -16,7 +16,7 @@
 
 import abc
 from collections.abc import Callable
-from typing import Literal, NamedTuple, Union
+from typing import Literal, NamedTuple, Optional, Union
 import warnings
 
 from disentangled_rnns.library import rnn_utils
@@ -45,7 +45,7 @@ class BaseEnvironment(abc.ABC):
     n_arms: The number of arms in the environment.
   """
 
-  def __init__(self, seed: int | None = None, n_arms: int = 2):
+  def __init__(self, seed: Optional[int] = None, n_arms: int = 2):
     self._random_state = np.random.RandomState(seed)
     self._n_arms = n_arms
 
@@ -95,7 +95,7 @@ class EnvironmentBanditsDrift(BaseEnvironment):
       self,
       sigma: float,
       p_instructed: float = 0.0,
-      seed: int | None = None,
+      seed: Optional[int] = None,
       n_arms: int = 2,
   ):
     super().__init__(seed=seed, n_arms=n_arms)
@@ -183,7 +183,7 @@ class EnvironmentPayoutMatrix(BaseEnvironment):
   def __init__(
       self,
       payout_matrix: np.ndarray,
-      instructed_matrix: np.ndarray | None = None,
+      instructed_matrix: Optional[np.ndarray] = None,
   ):
     """Initialize the environment.
 
@@ -403,10 +403,7 @@ class AgentNetwork:
   """
 
   def __init__(
-      self, make_network: Callable[[], hk.RNNCore],
-      params: rnn_utils.RnnParams,
-      network_input: np.ndarray, # xs for one session from DatasetRNN 
-      # trials x 1 x inputs (choice and reward and last two inputs)
+      self, make_network: Callable[[], hk.RNNCore], params: rnn_utils.RnnParams
   ):
 
     def step_network(
@@ -428,15 +425,14 @@ class AgentNetwork:
     self._model_fun = jax.jit(
         lambda xs, state: model.apply(params, xs, state)
     )
-    self._xs = network_input.copy()
+    self._xs = np.zeros((1, 2))
     self.new_session()
 
   def new_session(self):
     self._rnn_state = self._initial_state
-    self.trial_index = 0
 
   def get_choice_probs(self) -> np.ndarray:
-    output_logits, _ = self._model_fun(self._xs[self.trial_index], self._rnn_state)
+    output_logits, _ = self._model_fun(self._xs, self._rnn_state)
     choice_probs = np.asarray(jax.nn.softmax(output_logits[0,:2]))
     return choice_probs
 
@@ -445,10 +441,9 @@ class AgentNetwork:
     choice = np.random.choice(2, p=choice_probs)
     return choice
 
-  def update(self, choice: int, reward: int):
-    self.trial_index += 1
-    self._xs[self.trial_index,0,-2:] = np.array([[choice, reward]])
-    _, self._rnn_state = self._model_fun(self._xs[self.trial_index], self._rnn_state)
+  def update(self, xs: np.ndarray):
+    self._xs = xs
+    _, self._rnn_state = self._model_fun(self._xs, self._rnn_state)
 
 
 Agent = Union[AgentQ, AgentLeakyActorCritic, AgentNetwork]
@@ -477,6 +472,8 @@ def run_experiment(
   choices = np.zeros(n_steps)
   rewards = np.zeros(n_steps)
   reward_probs = np.full((n_steps, environment.n_arms), np.nan)
+  if hasattr(environment, 'xs'):
+    agent._xs = environment.xs[0]
 
   for step in np.arange(n_steps):
     # First record environment reward probs
@@ -484,11 +481,12 @@ def run_experiment(
       reward_probs[step] = environment.reward_probs
     # First agent makes a choice
     attempted_choice = agent.get_choice()
-    # Then environment computes a reward
-    choice, reward, _ = environment.step(attempted_choice, step)
+    # Then environment computes a reward and generates any other inputs
+    # required for next step
+    choice, reward, xs = environment.step(attempted_choice, step)
     # Finally agent learns
     if step < n_steps-1:
-        agent.update(choice, reward)
+        agent.update(xs)
     # Log choice and reward
     choices[step] = choice
     rewards[step] = reward
@@ -507,6 +505,8 @@ def create_dataset(
     environment: BaseEnvironment,
     n_steps_per_session: int,
     n_sessions: int,
+    batch_size: int | None = None,
+    batch_mode: Literal['single', 'rolling', 'random'] = 'single',
 ) -> rnn_utils.DatasetRNN:
   """Generates a behavioral dataset from a given agent and environment.
 
@@ -516,6 +516,9 @@ def create_dataset(
     n_steps_per_session: The number of trials in each behavioral session to be
       generated
     n_sessions: The number of sessions to generate
+    batch_size: The size of the batches to serve from the dataset
+    batch_mode: Batch mode to pass to DatasetRNN. Must be a type that is
+      supported by DatasetRNN.
 
   Returns:
     rnn_utils.DatasetRNN object
@@ -541,6 +544,8 @@ def create_dataset(
       y_names=['choice'],
       y_type='categorical',
       n_classes=2,
+      batch_size=batch_size,
+      batch_mode=batch_mode,
   )
   return dataset
 

@@ -441,7 +441,7 @@ class AgentNetwork:
     choice = np.random.choice(2, p=choice_probs)
     return choice
 
-  def update(self, xs: np.ndarray):
+  def update(self, choice: int, reward: int, xs: np.ndarray):
     self._xs = xs
     _, self._rnn_state = self._model_fun(self._xs, self._rnn_state)
 
@@ -485,8 +485,8 @@ def run_experiment(
     # required for next step
     choice, reward, xs = environment.step(attempted_choice, step)
     # Finally agent learns
-    if step < n_steps-1:
-        agent.update(xs)
+    if step < n_steps - 1:
+        agent.update(choice,reward,xs)
     # Log choice and reward
     choices[step] = choice
     rewards[step] = reward

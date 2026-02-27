@@ -17,7 +17,7 @@
 from collections.abc import Callable
 import json
 import sys
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Optional
 import warnings
 
 from absl import logging
@@ -57,42 +57,38 @@ class DatasetRNN:
       xs: np.typing.NDArray[np.number],
       ys: np.typing.NDArray[np.number],
       y_type: Literal['categorical', 'scalar', 'mixed'] = 'categorical',
-      batch_mode: Literal['single', 'rolling', 'random'] = 'random',
-      batch_size: int | None = 1024,
-      n_classes: int | None = None,
-      x_names: list[str] | None = None,
-      y_names: list[str] | None = None,
-      rng: np.random.Generator | None = None,
+      n_classes: Optional[int] = None,
+      x_names: Optional[list[str]] = None,
+      y_names: Optional[list[str]] = None,
+      batch_size: Optional[int] = None,
+      batch_mode: Literal['single', 'rolling', 'random'] = 'single',
   ):
-    """Do error checking and define properties.
+    """Do error checking and bin up the dataset into batches.
 
     Args:
       xs: Values to become inputs to the network. Should have dimensionality
         [timestep, episode, feature]. Must be numeric, will be cast to float32.
       ys: Values to become output targets for the RNN. Should have
         dimensionality [timestep, episode, feature].
-      y_type: The type of the target variable(s). Options are:
-        'categorical': Targets must be integers representing classes.
-        'scalar': Targets must be numeric and will be cast to float32.
-        'mixed': Assumes the first target feature is categorical and the rest
-          are scalar.
-      batch_mode: How to batch the dataset. Options are:
-        'random' [default]: Batches are formed by sampling episodes randomly
-           with replacement.
-        'rolling': Batches are formed by taking consecutive episodes in time,
-           wrapping around at the end of the dataset.
-        'single': All episodes are served together in a single batch.
-      batch_size: The size of the batch (number of episodes) to serve up each
-        time next() is called. If batch_mode is 'single', this is ignored and
-        all episodes are served together in a single batch.
+      y_type: The type of the target variable(s). Can be 'categorical',
+        'scalar', or 'mixed'. - 'categorical': Targets must be integers
+        representing classes. - 'scalar': Targets must be numeric and will be
+        cast to float32. - 'mixed': Assumes the first target feature is
+        categorical and the rest are scalar.
       n_classes: The number of classes in the categorical targets. If not
         specified, will be inferred from the data.
       x_names: A list of names for the features in xs. If not supplied, will be
         generated automatically.
       y_names: A list of names for the features in ys. If not supplied, will be
         generated automatically.
-      rng: A numpy random number generator. If not supplied, a new one will be
-        created.
+      batch_size: The size of the batch (number of episodes) to serve up each
+        time next() is called. If not specified, all episodes in the dataset
+        will be served
+      batch_mode: How to batch the dataset. Options are 'single', 'rolling', and
+        'random'. In 'single' mode, all episodes are served together. In
+        'rolling' mode, a new batch is formed by rolling the episodes forward in
+        time. In 'random' mode, a new batch is formed by randomly sampling
+        episodes. If not specified, will default to 'single'.
     """
     ##################
     # Error checking #
@@ -188,11 +184,14 @@ class DatasetRNN:
     ####################
     # Property setting #
     ####################
-    # If batch size is None, set it to the number of episodes.
+    # If batch size not specified, use all episodes in a single batch
     if batch_size is None:
-      assert batch_mode not in ['rolling', 'random'], (
-          f'batch_mode was {batch_mode}, which requires batch_size to be'
-          f' specified. Instead, batch_size was {batch_size}.'
+      batch_size = xs.shape[1]
+    # In single-batch mode, batch size must match dataset size
+    if batch_mode == 'single' and batch_size != xs.shape[1]:
+      raise ValueError(
+          'In single batch mode, match size must be equal to dataset size, or',
+          f'must be None. Instead, is {batch_size}',
       )
 
     self.x_names = x_names
@@ -206,17 +205,16 @@ class DatasetRNN:
     self._n_timesteps = self._xs.shape[0]
     self.batch_mode = batch_mode
     self._current_start_index = 0  # For batch_mode='rolling'
-    self.rng = rng if rng is not None else np.random.default_rng()
 
   def __iter__(self):
     return self
 
   def get_all(self):
-    """Returns all the data in the dataset. Use this for evaluation."""
-    return {'xs': self._xs, 'ys': self._ys}
+    """Returns all the data in the dataset."""
+    return self._xs, self._ys
 
   def __next__(self):
-    """Return a batch of data. Use this for training."""
+    """Return a batch of data, including both xs and ys."""
 
     if self.batch_size == 0:
       # Return empty arrays with correct number of dimensions
@@ -227,7 +225,7 @@ class DatasetRNN:
           (self._n_timesteps, 0, self._ys.shape[2]), dtype=self._ys.dtype
       )
       warnings.warn('DatasetRNN batch_size is 0. Returning an empty batch.')
-      return {'xs': empty_xs, 'ys': empty_ys}
+      return empty_xs, empty_ys
 
     if self.batch_mode == 'single':
       return self.get_all()
@@ -246,11 +244,11 @@ class DatasetRNN:
       self._current_start_index = (
           self._current_start_index + self.batch_size
       ) % self._n_episodes
-      return {'xs': xs_batch, 'ys': ys_batch}
+      return xs_batch, ys_batch
 
     elif self.batch_mode == 'random':
-      inds_to_get = self.rng.choice(self._n_episodes, size=self.batch_size)
-      return {'xs': self._xs[:, inds_to_get], 'ys': self._ys[:, inds_to_get]}
+      inds_to_get = np.random.choice(self._n_episodes, size=self.batch_size)
+      return self._xs[:, inds_to_get], self._ys[:, inds_to_get]
 
     else:
       raise ValueError(
@@ -263,16 +261,7 @@ def split_dataset(
     dataset: DatasetRNN, eval_every_n: int, eval_offset: int = 1
 ) -> tuple[DatasetRNN, DatasetRNN]:
   """Split a dataset into train and eval sets."""
-  data = dataset.get_all()
-  xs, ys = data['xs'], data['ys']
-  if data.keys() != {'xs', 'ys'}:
-    raise NotImplementedError(
-        f'Splitting is only implemented for datasets with keys xs and ys. This'
-        f' one has keys {data.keys()}.'
-        ' If you need to split a dataset with other data, feel free to '
-        'implement this and send a CL!'
-    )
-
+  xs, ys = dataset.get_all()
   n_sessions = xs.shape[1]
   train_sessions = np.ones(n_sessions, dtype=bool)
   if eval_offset < 0 or eval_offset > eval_every_n - 1:
@@ -283,6 +272,11 @@ def split_dataset(
   train_sessions[np.arange(eval_offset, n_sessions, eval_every_n)] = False
   eval_sessions = np.logical_not(train_sessions)
 
+  if dataset.batch_mode == 'single':
+    batch_size = None
+  else:
+    batch_size = dataset.batch_size
+
   dataset_train = DatasetRNN(
       xs[:, train_sessions, :],
       ys[:, train_sessions, :],
@@ -290,9 +284,8 @@ def split_dataset(
       y_names=dataset.y_names,
       y_type=dataset.y_type,
       n_classes=dataset.n_classes,
-      batch_size=dataset.batch_size,
+      batch_size=batch_size,
       batch_mode=dataset.batch_mode,
-      rng=dataset.rng,
   )
   dataset_eval = DatasetRNN(
       xs[:, eval_sessions, :],
@@ -301,9 +294,8 @@ def split_dataset(
       y_names=dataset.y_names,
       y_type=dataset.y_type,
       n_classes=dataset.n_classes,
-      batch_size=dataset.batch_size,
+      batch_size=None,
       batch_mode=dataset.batch_mode,
-      rng=dataset.rng,
   )
   return dataset_train, dataset_eval
 
@@ -624,13 +616,13 @@ def compute_penalty(
 def train_network(
     make_network: Callable[[], hk.RNNCore],
     training_dataset: DatasetRNN,
-    validation_dataset: DatasetRNN | None,
+    validation_dataset: Optional[DatasetRNN],
     opt: optax.GradientTransformation = optax.adam(1e-3),
-    random_key: chex.PRNGKey | None = None,
-    opt_state: optax.OptState | None = None,
-    params: RnnParams | None = None,
+    random_key: Optional[chex.PRNGKey] = None,
+    opt_state: Optional[optax.OptState] = None,
+    params: Optional[RnnParams] = None,
     n_steps: int = 1000,
-    max_grad_norm: float = 1,
+    max_grad_norm: float = 1e10,
     loss_param: dict[str, float] | float = 1.0,
     loss: Literal[
         'mse',
@@ -643,7 +635,7 @@ def train_network(
     log_losses_every: int = 10,
     do_plot: bool = False,
     report_progress_by: Literal['print', 'log', 'wandb', 'none'] = 'print',
-    wandb_run: Any | None = None,
+    wandb_run: Optional[Any] = None,
     wandb_step_offset: int = 0,
 ) -> tuple[RnnParams, optax.OptState, dict[str, np.ndarray]]:
   """Trains a Haiku recurrent neural network.
@@ -697,7 +689,7 @@ def train_network(
   # If loaded from json, params might be a nested dict of lists. Convert to np.
   if params is not None:
     params = to_np(params)
-  sample_xs = next(training_dataset)['xs']  # Get a sample input, for shape
+  sample_xs, _ = next(training_dataset)  # Get a sample input, for shape
 
   # Haiku, step one: Define the batched network
   def unroll_network(xs):
@@ -845,7 +837,7 @@ def train_network(
     loss, grads = jax.value_and_grad(compute_loss, argnums=0)(
         params, xs, ys, random_key
     )
-    grads, opt_state = opt.update(grads, opt_state)
+    grads, opt_state = opt.update(grads, opt_state, params)
     clipped_grads = optimizers.clip_grads(grads, max_grad_norm)
     params = optax.apply_updates(params, clipped_grads)
     return loss, params, opt_state
@@ -858,12 +850,10 @@ def train_network(
   validation_loss = []
   l_validation = np.nan
 
-  data = next(training_dataset)
-  xs_train, ys_train = data['xs'], data['ys']
+  xs_train, ys_train = next(training_dataset)
 
   if validation_dataset is not None:
-    data = validation_dataset.get_all()
-    xs_eval, ys_eval = data['xs'], data['ys']
+    xs_eval, ys_eval = validation_dataset.get_all()
   else:
     xs_eval = None
     ys_eval = None
@@ -874,8 +864,7 @@ def train_network(
     )
     # If the training dataset uses batching, get a new batch
     if training_dataset.batch_mode != 'single':
-      data = next(training_dataset)
-      xs_train, ys_train = data['xs'], data['ys']
+      xs_train, ys_train = next(training_dataset)
 
     loss, params, opt_state = train_step(
         params, opt_state, xs_train, ys_train, subkey_train
@@ -981,7 +970,7 @@ def eval_network(
     return ys, states
 
   model = hk.transform(unroll_network)
-  key = jax.random.PRNGKey(np.random.randint(2**32))
+  key = jax.random.PRNGKey(np.random.randint(2**31))
   apply = jax.jit(model.apply)
   y_hats, states = apply(params, key, xs)
 
@@ -1069,7 +1058,7 @@ def step_network(
 
 def get_initial_state(
     make_network: Callable[[], hk.RNNCore],
-    params: RnnParams | None = None,
+    params: Optional[RnnParams] = None,
     batch_size: int = 1,
     seed: int = 0,
 ) -> Any:
@@ -1112,7 +1101,7 @@ def get_initial_state(
 def get_new_params(
     make_network: Callable[..., hk.RNNCore],
     input_size: int,
-    random_key: jax.Array | None = None,
+    random_key: Optional[jax.Array] = None,
 ) -> RnnParams:
   """Get a new set of random parameters for a network architecture.
 

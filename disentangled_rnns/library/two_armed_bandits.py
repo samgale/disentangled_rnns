@@ -439,7 +439,7 @@ class AgentNetwork:
   def get_choice(self) -> tuple[int, np.ndarray]:
     choice_probs = self.get_choice_probs()
     choice = np.random.choice(2, p=choice_probs)
-    return choice
+    return choice, choice_probs
 
   def update(self, choice: int, reward: int, xs: np.ndarray):
     self._xs = xs
@@ -480,10 +480,10 @@ def run_experiment(
     if hasattr(environment, 'reward_probs'):
       reward_probs[step] = environment.reward_probs
     # First agent makes a choice
-    attempted_choice = agent.get_choice()
+    attempted_choice, choice_probs = agent.get_choice()
     # Then environment computes a reward and generates any other inputs
     # required for next step
-    choice, reward, xs = environment.step(attempted_choice, step)
+    choice, reward, xs = environment.step(attempted_choice, choice_probs, step)
     # Finally agent learns
     if step < n_steps - 1:
         agent.update(choice,reward,xs)

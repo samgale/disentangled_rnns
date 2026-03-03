@@ -442,8 +442,8 @@ class AgentNetwork:
     return choice, choice_probs
 
   def update(self, choice: int, reward: int, xs: np.ndarray):
-    self._xs = xs
     _, self._rnn_state = self._model_fun(self._xs, self._rnn_state)
+    self._xs = xs
 
 
 Agent = Union[AgentQ, AgentLeakyActorCritic, AgentNetwork]

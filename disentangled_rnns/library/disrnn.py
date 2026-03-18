@@ -116,8 +116,13 @@ class DisRnnConfig:
     choice_net_n_layers: Number of layers in the choice network
     noiseless_mode: Allows turning off the bottlenecks e.g. for evaluation
     latent_penalty: Multiplier for KL cost on the latent bottlenecks
+    choice_obs_size: Number of dimensions in the choice observation vector.
+      These are separate observation inputs that feed directly into the choice
+      network. Default 0 means no choice observations (backward compatible).
     choice_net_latent_penalty: Multiplier for bottleneck cost on latent inputs
       to the choice network
+    choice_net_obs_penalty: Multiplier for bottleneck cost on observation
+      inputs to the choice network
     update_net_obs_penalty: Multiplier for bottleneck cost on observation
       inputs to the update network
     update_net_latent_penalty: Multiplier for latent inputs to the update
@@ -128,12 +133,15 @@ class DisRnnConfig:
     max_latent_value: Cap on the possible absolute value of a latent. Used to
       prevent runaway latents resulting in NaNs
     x_names: Names of the observation vector elements. Must have length obs_size
+    xs_choice_names: Names of the choice observation elements. Must have length
+      choice_obs_size
     y_names: Names of the target vector elements. Must have length target_size
   """
 
   obs_size: int = 2
   output_size: int = 2
   latent_size: int = 10
+  choice_obs_size: int = 0
 
   update_net_n_units_per_layer: int = 10
   update_net_n_layers: int = 2
@@ -147,12 +155,14 @@ class DisRnnConfig:
   update_net_obs_penalty: float = 0.0
   update_net_latent_penalty: float = 0.0
   choice_net_latent_penalty: float = 0.0
+  choice_net_obs_penalty: float = 0.0
 
   l2_scale: float = 0.01
 
   max_latent_value: float = 2.
 
   x_names: list[str] | None = None
+  xs_choice_names: list[str] | None = None
   y_names: list[str] | None = None
 
   def __post_init__(self):
@@ -166,6 +176,18 @@ class DisRnnConfig:
           f'Based on obs_size {self.obs_size}, expected x_names to have '
           f'length {self.obs_size} but got {self.x_names}'
       )
+
+    if self.choice_obs_size > 0:
+      if self.xs_choice_names is None:
+        self.xs_choice_names = [
+            f'Choice Observation {i}' for i in range(self.choice_obs_size)
+        ]
+      if len(self.xs_choice_names) != self.choice_obs_size:
+        raise ValueError(
+            f'Based on choice_obs_size {self.choice_obs_size}, expected'
+            f' xs_choice_names to have length {self.choice_obs_size} but got'
+            f' {self.xs_choice_names}'
+        )
 
     # Check activation is in jax.nn
     try:
@@ -323,10 +345,13 @@ class HkDisentangledRNN(hk.RNNCore):
     self._choice_net_n_units_per_layer = config.choice_net_n_units_per_layer
     self._choice_net_n_layers = config.choice_net_n_layers
 
+    self._choice_obs_size = config.choice_obs_size
+
     self._latent_penalty = config.latent_penalty
     self._update_net_obs_penalty = config.update_net_obs_penalty
     self._update_net_latent_penalty = config.update_net_latent_penalty
     self._choice_net_latent_penalty = config.choice_net_latent_penalty
+    self._choice_net_obs_penalty = config.choice_net_obs_penalty
     self._activation = getattr(jax.nn, config.activation)
     self._max_latent_value = config.max_latent_value
 
@@ -386,6 +411,14 @@ class HkDisentangledRNN(hk.RNNCore):
             name='choice_net',
         )
     )
+    # Choice network may also get direct observation inputs
+    if self._choice_obs_size > 0:
+      self._choice_net_obs_sigmas, self._choice_net_obs_multipliers = (
+          get_initial_bottleneck_params(
+              shape=(self._choice_obs_size,),
+              name='choice_net_obs',
+          )
+      )
 
   def initial_state(self, batch_size: int | None) -> Any:
     # (batch_size, latent_size)
@@ -475,7 +508,12 @@ class HkDisentangledRNN(hk.RNNCore):
 
     return predicted_targets, penalty_increment
 
-  def __call__(self, observations: jnp.ndarray, prev_latents: jnp.ndarray):
+  def __call__(self, inputs: jnp.ndarray, prev_latents: jnp.ndarray):
+    # Split concatenated inputs into update observations and choice observations
+    observations = inputs[:, :self._obs_size]
+    if self._choice_obs_size > 0:
+      choice_observations = inputs[:, self._obs_size:]
+
     # Initial penalty values. Shape is (batch_size,)
     batch_size = prev_latents.shape[0]
     penalty = jnp.zeros(shape=(batch_size,))
@@ -521,13 +559,28 @@ class HkDisentangledRNN(hk.RNNCore):
     penalty += penalty_increment
 
     # Set up choice net inputs from new_latents.
-    choice_net_inputs, choice_net_input_kl = information_bottleneck(
+    choice_net_latent_inputs, choice_net_input_kl = information_bottleneck(
         inputs=new_latents,
         sigmas=self._choice_net_sigmas,
         multipliers=self._choice_net_multipliers,
         noiseless_mode=self._noiseless_mode,
     )
     penalty += self._choice_net_latent_penalty * choice_net_input_kl
+
+    # Add choice observations to choice net inputs if present
+    if self._choice_obs_size > 0:
+      choice_net_obs_inputs, choice_net_obs_kl = information_bottleneck(
+          inputs=choice_observations,
+          sigmas=self._choice_net_obs_sigmas,
+          multipliers=self._choice_net_obs_multipliers,
+          noiseless_mode=self._noiseless_mode,
+      )
+      penalty += self._choice_net_obs_penalty * choice_net_obs_kl
+      choice_net_inputs = jnp.concatenate(
+          [choice_net_obs_inputs, choice_net_latent_inputs], axis=1
+      )
+    else:
+      choice_net_inputs = choice_net_latent_inputs
 
     predicted_targets, penalty_increment = self.predict_targets(
         choice_net_inputs
@@ -573,8 +626,17 @@ def log_bottlenecks(params,
       )
   )
 
+  # Choice observation bottlenecks (only present when choice_obs_size > 0)
+  has_choice_obs = 'choice_net_obs_sigma_params' in params_disrnn
+  if has_choice_obs:
+    choice_obs_sigmas = np.array(
+        reparameterize_sigma(params_disrnn['choice_net_obs_sigma_params'])
+    )
+
   latent_bottlenecks_open = np.sum(latent_sigmas < open_thresh)
   choice_bottlenecks_open = np.sum(choice_sigmas < open_thresh)
+  if has_choice_obs:
+    choice_bottlenecks_open += np.sum(choice_obs_sigmas < open_thresh)
   update_obs_bottlenecks_open = np.sum(update_obs_sigmas < open_thresh)
   update_latent_bottlenecks_open = np.sum(update_latent_sigmas < open_thresh)
   update_bottlenecks_open = (
@@ -583,6 +645,10 @@ def log_bottlenecks(params,
 
   latent_bottlenecks_partial = np.sum(latent_sigmas < partially_open_thresh)
   choice_bottlenecks_partial = np.sum(choice_sigmas < partially_open_thresh)
+  if has_choice_obs:
+    choice_bottlenecks_partial += np.sum(
+        choice_obs_sigmas < partially_open_thresh
+    )
   update_obs_bottlenecks_partial = np.sum(
       update_obs_sigmas < partially_open_thresh
   )
@@ -595,6 +661,8 @@ def log_bottlenecks(params,
 
   latent_bottlenecks_closed = np.sum(latent_sigmas > closed_thresh)
   choice_bottlenecks_closed = np.sum(choice_sigmas > closed_thresh)
+  if has_choice_obs:
+    choice_bottlenecks_closed += np.sum(choice_obs_sigmas > closed_thresh)
   update_obs_bottlenecks_closed = np.sum(update_obs_sigmas > closed_thresh)
   update_latent_bottlenecks_closed = np.sum(
       update_latent_sigmas > closed_thresh
@@ -631,12 +699,19 @@ def get_total_sigma(params):
   choice_bottlenecks = reparameterize_sigma(
       params_disrnn['choice_net_sigma_params'])
 
-  return float(
+  total = (
       jnp.sum(latent_bottlenecks)
       + jnp.sum(update_obs_bottlenecks)
       + jnp.sum(update_latent_bottlenecks)
       + jnp.sum(choice_bottlenecks)
   )
+
+  if 'choice_net_obs_sigma_params' in params_disrnn:
+    choice_obs_bottlenecks = reparameterize_sigma(
+        params_disrnn['choice_net_obs_sigma_params'])
+    total += jnp.sum(choice_obs_bottlenecks)
+
+  return float(total)
 
 
 def get_auxiliary_metrics(params: rnn_utils.RnnParams) -> dict[str, Any]:

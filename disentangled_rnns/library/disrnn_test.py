@@ -17,6 +17,7 @@ from disentangled_rnns.library import disrnn
 from disentangled_rnns.library import get_datasets
 from disentangled_rnns.library import plotting
 from disentangled_rnns.library import rnn_utils
+import numpy as np
 
 
 class DisrnnTest(absltest.TestCase):
@@ -150,6 +151,123 @@ class DisrnnTest(absltest.TestCase):
     self.assertIn('latent_bottlenecks_open', metrics)
     self.assertIn('choice_bottlenecks_open', metrics)
     self.assertIn('update_bottlenecks_open', metrics)
+    self.assertGreaterEqual(metrics['total_sigma'], 0)
+
+
+
+class DisrnnWithChoiceObsTest(absltest.TestCase):
+  """Tests for HkDisentangledRNN with choice observation inputs."""
+
+  def setUp(self):
+    super().setUp()
+    self.choice_obs_size = 2
+    self.disrnn_config = disrnn.DisRnnConfig(
+        latent_size=5,
+        obs_size=2,
+        output_size=2,
+        choice_obs_size=self.choice_obs_size,
+        update_net_n_units_per_layer=4,
+        update_net_n_layers=2,
+        choice_net_n_units_per_layer=2,
+        choice_net_n_layers=2,
+    )
+    # Create dataset with xs_choice
+    self.q_dataset = get_datasets.get_q_learning_dataset(
+        n_sessions=11, n_trials=7
+    )
+    # Add xs_choice to the dataset
+    xs_all = self.q_dataset._xs
+    xs_choice = np.random.randn(
+        xs_all.shape[0], xs_all.shape[1], self.choice_obs_size
+    ).astype(np.float32)
+    self.q_dataset_with_choice = rnn_utils.DatasetRNN(
+        xs=self.q_dataset._xs,
+        ys=self.q_dataset._ys,
+        y_type=self.q_dataset.y_type,
+        n_classes=self.q_dataset.n_classes,
+        xs_choice=xs_choice,
+    )
+    self.disrnn_params, _, _ = rnn_utils.train_network(
+        make_network=lambda: disrnn.HkDisentangledRNN(self.disrnn_config),
+        training_dataset=self.q_dataset_with_choice,
+        validation_dataset=None,
+        n_steps=0,
+    )
+
+  def test_disrnn_with_choice_obs_params(self):
+    """Check that choice obs bottleneck params exist with correct shapes."""
+    params = self.disrnn_params['hk_disentangled_rnn']
+    self.assertIn('choice_net_obs_sigma_params', params)
+    self.assertIn('choice_net_obs_multipliers', params)
+    self.assertEqual(
+        params['choice_net_obs_sigma_params'].shape,
+        (self.choice_obs_size,),
+    )
+    self.assertEqual(
+        params['choice_net_obs_multipliers'].shape,
+        (self.choice_obs_size,),
+    )
+
+  def test_disrnn_with_choice_obs_output_shape(self):
+    """Check output shape is unchanged (output_size + 1)."""
+    xs = self.q_dataset_with_choice.get_all()['xs']
+    n_sessions, n_trials = xs.shape[:2]
+
+    network_outputs, network_states = rnn_utils.eval_network(
+        lambda: disrnn.HkDisentangledRNN(self.disrnn_config),
+        self.disrnn_params,
+        xs,
+    )
+    # Output shape unchanged: (batch_size, output_size + 1)
+    self.assertEqual(network_outputs.shape, (n_sessions, n_trials, 3))
+    self.assertEqual(
+        network_states.shape,
+        (n_sessions, n_trials, self.disrnn_config.latent_size),
+    )
+
+  def test_disrnn_with_choice_obs_trainable(self):
+    """Smoke test: train with choice_obs_size > 0."""
+    _, _, _ = rnn_utils.train_network(
+        make_network=lambda: disrnn.HkDisentangledRNN(self.disrnn_config),
+        training_dataset=self.q_dataset_with_choice,
+        validation_dataset=None,
+        params=self.disrnn_params,
+        n_steps=10,
+    )
+
+  def test_disrnn_with_choice_obs_choice_net_input_size(self):
+    """Verify choice net input size includes both latents and choice obs."""
+    choice_net_params = self.disrnn_params[
+        'hk_disentangled_rnn/~predict_targets/choice_net'
+    ]
+    expected_input_size = (
+        self.disrnn_config.latent_size + self.choice_obs_size
+    )
+    self.assertEqual(
+        choice_net_params['input_weights'].shape,
+        (expected_input_size, self.disrnn_config.choice_net_n_units_per_layer),
+    )
+
+  def test_disrnn_backward_compat_no_choice_obs(self):
+    """Verify choice_obs_size=0 produces no choice_net_obs params."""
+    config_no_choice = disrnn.DisRnnConfig(
+        latent_size=5, obs_size=2, output_size=2, choice_obs_size=0,
+    )
+    params, _, _ = rnn_utils.train_network(
+        make_network=lambda: disrnn.HkDisentangledRNN(config_no_choice),
+        training_dataset=self.q_dataset,
+        validation_dataset=None,
+        n_steps=0,
+    )
+    disrnn_params = params['hk_disentangled_rnn']
+    self.assertNotIn('choice_net_obs_sigma_params', disrnn_params)
+    self.assertNotIn('choice_net_obs_multipliers', disrnn_params)
+
+  def test_get_auxiliary_metrics_with_choice_obs(self):
+    """Smoke test for get_auxiliary_metrics with choice obs."""
+    metrics = disrnn.get_auxiliary_metrics(self.disrnn_params)
+    self.assertIsInstance(metrics, dict)
+    self.assertIn('total_sigma', metrics)
     self.assertGreaterEqual(metrics['total_sigma'], 0)
 
 

@@ -60,14 +60,17 @@ class DatasetRNN:
       n_classes: Optional[int] = None,
       x_names: Optional[list[str]] = None,
       y_names: Optional[list[str]] = None,
+      xs_choice: Optional[np.typing.NDArray[np.number]] = None,
+      xs_choice_names: Optional[list[str]] = None,
       batch_size: Optional[int] = None,
       batch_mode: Literal['single', 'rolling', 'random'] = 'single',
   ):
     """Do error checking and bin up the dataset into batches.
 
     Args:
-      xs: Values to become inputs to the network. Should have dimensionality
-        [timestep, episode, feature]. Must be numeric, will be cast to float32.
+      xs: Values to become inputs to the update network. Should have
+        dimensionality [timestep, episode, feature]. Must be numeric, will be
+        cast to float32.
       ys: Values to become output targets for the RNN. Should have
         dimensionality [timestep, episode, feature].
       y_type: The type of the target variable(s). Can be 'categorical',
@@ -81,6 +84,13 @@ class DatasetRNN:
         generated automatically.
       y_names: A list of names for the features in ys. If not supplied, will be
         generated automatically.
+      xs_choice: Optional observation inputs for the choice network. Should have
+        dimensionality [timestep, episode, feature] with the same number of
+        timesteps and episodes as xs. May have a different number of features.
+        When provided, these are concatenated with xs along the feature axis
+        when serving batches, so the network receives [xs | xs_choice].
+      xs_choice_names: A list of names for the features in xs_choice. If not
+        supplied, will be generated automatically.
       batch_size: The size of the batch (number of episodes) to serve up each
         time next() is called. If not specified, all episodes in the dataset
         will be served
@@ -181,6 +191,29 @@ class DatasetRNN:
             f' features in ys {ys.shape[-1]}.'
         )
 
+    # Process xs_choice and xs_choice_names
+    if xs_choice is not None:
+      if xs_choice.shape[0] != xs.shape[0]:
+        raise ValueError(
+            f'Number of timesteps in xs_choice {xs_choice.shape[0]} must be'
+            f' equal to number of timesteps in xs {xs.shape[0]}.'
+        )
+      if xs_choice.shape[1] != xs.shape[1]:
+        raise ValueError(
+            f'Number of episodes in xs_choice {xs_choice.shape[1]} must be'
+            f' equal to number of episodes in xs {xs.shape[1]}.'
+        )
+      if xs_choice_names is None:
+        xs_choice_names = [
+            f'Choice Observation {i}' for i in range(xs_choice.shape[2])
+        ]
+      else:
+        if len(xs_choice_names) != xs_choice.shape[2]:
+          raise ValueError(
+              f'Number of xs_choice_names {len(xs_choice_names)} must be equal'
+              f' to number of features in xs_choice {xs_choice.shape[2]}.'
+          )
+
     ####################
     # Property setting #
     ####################
@@ -196,11 +229,15 @@ class DatasetRNN:
 
     self.x_names = x_names
     self.y_names = y_names
+    self.xs_choice_names = xs_choice_names
     self.y_type = y_type
     self.n_classes = n_classes
     self.batch_size = batch_size
     self._xs = xs.astype(np.float32)
     self._ys = ys.astype(np.float32)
+    self._xs_choice = (
+        xs_choice.astype(np.float32) if xs_choice is not None else None
+    )
     self._n_episodes = self._xs.shape[1]
     self._n_timesteps = self._xs.shape[0]
     self.batch_mode = batch_mode
@@ -209,9 +246,26 @@ class DatasetRNN:
   def __iter__(self):
     return self
 
+  def _concat_xs(self, xs):
+    """Concatenates xs with xs_choice along the feature axis if present."""
+    if self._xs_choice is not None:
+      return np.concatenate([xs, self._xs_choice], axis=2)
+    return xs
+
+  def _concat_xs_batch(self, xs_batch, batch_inds):
+    """Concatenates an xs batch with the corresponding xs_choice batch."""
+    if self._xs_choice is not None:
+      return np.concatenate(
+          [xs_batch, self._xs_choice[:, batch_inds]], axis=2
+      )
+    return xs_batch
+
   def get_all(self):
     """Returns all the data in the dataset."""
-    return self._xs, self._ys
+    result = {'xs': self._concat_xs(self._xs), 'ys': self._ys}
+    if self._xs_choice is not None:
+      result['xs_choice'] = self._xs_choice
+    return result
 
   def __next__(self):
     """Return a batch of data, including both xs and ys."""
@@ -225,7 +279,7 @@ class DatasetRNN:
           (self._n_timesteps, 0, self._ys.shape[2]), dtype=self._ys.dtype
       )
       warnings.warn('DatasetRNN batch_size is 0. Returning an empty batch.')
-      return empty_xs, empty_ys
+      return {'xs': empty_xs, 'ys': empty_ys}
 
     if self.batch_mode == 'single':
       return self.get_all()
@@ -239,16 +293,22 @@ class DatasetRNN:
       batch_inds = indices % self._n_episodes
 
       # Get the chunks of data
-      xs_batch, ys_batch = self._xs[:, batch_inds], self._ys[:, batch_inds]
+      xs_batch = self._concat_xs_batch(self._xs[:, batch_inds], batch_inds)
+      ys_batch = self._ys[:, batch_inds]
       # Update the starting index for the next batch, wrapping around
       self._current_start_index = (
           self._current_start_index + self.batch_size
       ) % self._n_episodes
-      return xs_batch, ys_batch
+      return {'xs': xs_batch, 'ys': ys_batch}
 
     elif self.batch_mode == 'random':
       inds_to_get = np.random.choice(self._n_episodes, size=self.batch_size)
-      return self._xs[:, inds_to_get], self._ys[:, inds_to_get]
+      return {
+          'xs': self._concat_xs_batch(
+              self._xs[:, inds_to_get], inds_to_get
+          ),
+          'ys': self._ys[:, inds_to_get],
+      }
 
     else:
       raise ValueError(
@@ -261,7 +321,8 @@ def split_dataset(
     dataset: DatasetRNN, eval_every_n: int, eval_offset: int = 1
 ) -> tuple[DatasetRNN, DatasetRNN]:
   """Split a dataset into train and eval sets."""
-  xs, ys = dataset.get_all()
+  xs, ys = dataset._xs, dataset._ys
+  xs_choice = dataset._xs_choice
   n_sessions = xs.shape[1]
   train_sessions = np.ones(n_sessions, dtype=bool)
   if eval_offset < 0 or eval_offset > eval_every_n - 1:
@@ -277,11 +338,20 @@ def split_dataset(
   else:
     batch_size = dataset.batch_size
 
+  xs_choice_train = (
+      xs_choice[:, train_sessions, :] if xs_choice is not None else None
+  )
+  xs_choice_eval = (
+      xs_choice[:, eval_sessions, :] if xs_choice is not None else None
+  )
+
   dataset_train = DatasetRNN(
       xs[:, train_sessions, :],
       ys[:, train_sessions, :],
       x_names=dataset.x_names,
       y_names=dataset.y_names,
+      xs_choice=xs_choice_train,
+      xs_choice_names=dataset.xs_choice_names,
       y_type=dataset.y_type,
       n_classes=dataset.n_classes,
       batch_size=batch_size,
@@ -292,6 +362,8 @@ def split_dataset(
       ys[:, eval_sessions, :],
       x_names=dataset.x_names,
       y_names=dataset.y_names,
+      xs_choice=xs_choice_eval,
+      xs_choice_names=dataset.xs_choice_names,
       y_type=dataset.y_type,
       n_classes=dataset.n_classes,
       batch_size=None,
@@ -689,7 +761,7 @@ def train_network(
   # If loaded from json, params might be a nested dict of lists. Convert to np.
   if params is not None:
     params = to_np(params)
-  sample_xs, _ = next(training_dataset)  # Get a sample input, for shape
+  sample_xs = next(training_dataset)['xs']  # Get a sample input, for shape
 
   # Haiku, step one: Define the batched network
   def unroll_network(xs):
@@ -850,10 +922,12 @@ def train_network(
   validation_loss = []
   l_validation = np.nan
 
-  xs_train, ys_train = next(training_dataset)
+  train_data = next(training_dataset)
+  xs_train, ys_train = train_data['xs'], train_data['ys']
 
   if validation_dataset is not None:
-    xs_eval, ys_eval = validation_dataset.get_all()
+    eval_data = validation_dataset.get_all()
+    xs_eval, ys_eval = eval_data['xs'], eval_data['ys']
   else:
     xs_eval = None
     ys_eval = None
@@ -864,7 +938,8 @@ def train_network(
     )
     # If the training dataset uses batching, get a new batch
     if training_dataset.batch_mode != 'single':
-      xs_train, ys_train = next(training_dataset)
+      train_data = next(training_dataset)
+      xs_train, ys_train = train_data['xs'], train_data['ys']
 
     loss, params, opt_state = train_step(
         params, opt_state, xs_train, ys_train, subkey_train

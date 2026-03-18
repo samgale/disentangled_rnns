@@ -389,5 +389,134 @@ class TestRNNUtils(absltest.TestCase):
         )
 
 
+  def test_dataset_rnn_with_xs_choice(self):
+    """Test DatasetRNN with xs_choice observation inputs."""
+    n_timesteps = 5
+    n_episodes = 3
+    n_features = 2
+    n_choice_features = 3
+    xs = np.random.randn(n_timesteps, n_episodes, n_features).astype(
+        np.float32
+    )
+    ys = np.zeros((n_timesteps, n_episodes, 1))
+    xs_choice = np.random.randn(
+        n_timesteps, n_episodes, n_choice_features
+    ).astype(np.float32)
+
+    dataset = rnn_utils.DatasetRNN(
+        xs=xs,
+        ys=ys,
+        y_type='scalar',
+        xs_choice=xs_choice,
+        xs_choice_names=['c0', 'c1', 'c2'],
+    )
+
+    # get_all() should include xs_choice and concatenated xs
+    data = dataset.get_all()
+    self.assertIn('xs', data)
+    self.assertIn('ys', data)
+    self.assertIn('xs_choice', data)
+    self.assertEqual(
+        data['xs'].shape,
+        (n_timesteps, n_episodes, n_features + n_choice_features),
+    )
+    self.assertEqual(
+        data['xs_choice'].shape,
+        (n_timesteps, n_episodes, n_choice_features),
+    )
+    # First n_features columns should be xs, rest should be xs_choice
+    np.testing.assert_array_equal(data['xs'][:, :, :n_features], xs)
+    np.testing.assert_array_equal(data['xs'][:, :, n_features:], xs_choice)
+
+    # next() should also return concatenated xs
+    batch_data = next(dataset)
+    self.assertEqual(
+        batch_data['xs'].shape,
+        (n_timesteps, n_episodes, n_features + n_choice_features),
+    )
+
+  def test_dataset_rnn_xs_choice_validation(self):
+    """Test that mismatched xs_choice shapes raise ValueError."""
+    xs = np.zeros((5, 3, 2))
+    ys = np.zeros((5, 3, 1))
+
+    # Mismatched timesteps
+    with self.assertRaises(ValueError):
+      rnn_utils.DatasetRNN(
+          xs=xs, ys=ys, y_type='scalar',
+          xs_choice=np.zeros((4, 3, 2)),
+      )
+
+    # Mismatched episodes
+    with self.assertRaises(ValueError):
+      rnn_utils.DatasetRNN(
+          xs=xs, ys=ys, y_type='scalar',
+          xs_choice=np.zeros((5, 2, 2)),
+      )
+
+    # Mismatched xs_choice_names length
+    with self.assertRaises(ValueError):
+      rnn_utils.DatasetRNN(
+          xs=xs, ys=ys, y_type='scalar',
+          xs_choice=np.zeros((5, 3, 2)),
+          xs_choice_names=['a'],
+      )
+
+  def test_dataset_rnn_xs_choice_names_auto(self):
+    """Test auto-generated xs_choice_names."""
+    xs = np.zeros((5, 3, 2))
+    ys = np.zeros((5, 3, 1))
+    xs_choice = np.zeros((5, 3, 3))
+
+    dataset = rnn_utils.DatasetRNN(
+        xs=xs, ys=ys, y_type='scalar', xs_choice=xs_choice
+    )
+    self.assertEqual(
+        dataset.xs_choice_names,
+        ['Choice Observation 0', 'Choice Observation 1',
+         'Choice Observation 2'],
+    )
+
+  def test_dataset_rnn_without_xs_choice(self):
+    """Test backward compat: no xs_choice means no concatenation."""
+    xs = np.zeros((5, 3, 2))
+    ys = np.zeros((5, 3, 1))
+
+    dataset = rnn_utils.DatasetRNN(xs=xs, ys=ys, y_type='scalar')
+    data = dataset.get_all()
+    self.assertNotIn('xs_choice', data)
+    self.assertEqual(data['xs'].shape, (5, 3, 2))
+
+  def test_split_dataset_with_xs_choice(self):
+    """Test that split_dataset propagates xs_choice."""
+    n_timesteps = 5
+    n_episodes = 4
+    xs = np.random.randn(n_timesteps, n_episodes, 2).astype(np.float32)
+    ys = np.zeros((n_timesteps, n_episodes, 1))
+    xs_choice = np.random.randn(n_timesteps, n_episodes, 3).astype(
+        np.float32
+    )
+
+    dataset = rnn_utils.DatasetRNN(
+        xs=xs, ys=ys, y_type='scalar',
+        xs_choice=xs_choice,
+        xs_choice_names=['c0', 'c1', 'c2'],
+    )
+
+    dataset_train, dataset_eval = rnn_utils.split_dataset(dataset, 2)
+
+    # Both should have xs_choice
+    self.assertIsNotNone(dataset_train._xs_choice)
+    self.assertIsNotNone(dataset_eval._xs_choice)
+    self.assertEqual(dataset_train.xs_choice_names, ['c0', 'c1', 'c2'])
+    self.assertEqual(dataset_eval.xs_choice_names, ['c0', 'c1', 'c2'])
+
+    # Concatenated xs should have correct shape
+    train_data = dataset_train.get_all()
+    eval_data = dataset_eval.get_all()
+    self.assertEqual(train_data['xs'].shape[2], 5)  # 2 + 3
+    self.assertEqual(eval_data['xs'].shape[2], 5)  # 2 + 3
+
+
 if __name__ == '__main__':
   absltest.main()

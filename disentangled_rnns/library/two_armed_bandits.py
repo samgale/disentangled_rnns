@@ -309,20 +309,19 @@ class AgentQ:
     )
     return choice_probs
 
-  def get_choice(self) -> tuple[int, np.ndarray]:
+  def get_choice(self) -> int:
     """Sample a choice, given the agent's current internal state."""
 
     choice_probs = self.get_choice_probs()
     choice = np.random.choice(2, p=choice_probs)
-    return choice, choice_probs
+    return choice
 
-  def update(self, choice: int, reward: float, xs: np.ndarray | None = None):
+  def update(self, choice: int, reward: float):
     """Update the agent after one step of the task.
 
     Args:
       choice: The choice made by the agent. 0 or 1
       reward: The reward received by the agent. 0 or 1
-      xs: Unused. Accepted for interface compatibility with AgentNetwork.
     """
     self.q[choice] = (1 - self._alpha) * self.q[choice] + self._alpha * reward
 
@@ -364,20 +363,19 @@ class AgentLeakyActorCritic:
     choice_probs = np.exp(self.theta) / np.sum(np.exp(self.theta))
     return choice_probs
 
-  def get_choice(self) -> tuple[int, np.ndarray]:
+  def get_choice(self) -> int:
     """Sample a choice, given the agent's current internal state."""
 
     choice_probs = self.get_choice_probs()
     choice = np.random.choice(2, p=choice_probs)
-    return choice, choice_probs
+    return choice
 
-  def update(self, choice: int, reward: float, xs: np.ndarray | None = None):
+  def update(self, choice: int, reward: float):
     """Update the agent after one step of the task.
 
     Args:
       choice: The choice made by the agent. 0 or 1
       reward: The reward received by the agent. 0 or 1
-      xs: Unused. Accepted for interface compatibility with AgentNetwork.
     """
     unchosen = 1 - choice  # Convert 0 to 1 or 1 to 0
     # Actor learning
@@ -483,13 +481,12 @@ def run_experiment(
       reward_probs[step] = environment.reward_probs
     # First agent makes a choice
     attempted_choice, choice_probs = agent.get_choice()
-    # Then environment computes a reward
-    choice, reward, instructed = environment.step(attempted_choice)
-    # Build xs for agents that need it (e.g. AgentNetwork)
-    xs = np.array([[choice, reward]])
+    # Then environment computes a reward and generates any other inputs
+    # required for next step
+    choice, reward, xs = environment.step(attempted_choice, choice_probs, step)
     # Finally agent learns
     if step < n_steps - 1:
-        agent.update(choice, reward, xs)
+        agent.update(choice,reward,xs)
     # Log choice and reward
     choices[step] = choice
     rewards[step] = reward
